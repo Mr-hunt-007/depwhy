@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	env := cli.Env{NoColorEnv: os.Getenv("NO_COLOR") != ""}
+	env := cli.Env{NoColorEnv: os.Getenv("NO_COLOR") != "", Stdin: os.Stdin}
 	if st, err := os.Stdout.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
 		env.StdoutIsTTY = true
 	}

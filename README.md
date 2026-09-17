@@ -197,6 +197,8 @@ depwhy: "leftpad" not found in package-lock.json (npm), uv.lock (python)
 | `--max-paths N` | `10` | paths to print per package; `0` prints all |
 | `--json` | off | print JSON instead of trees |
 | `--no-color` | off | disable colour; `NO_COLOR` is also honoured, and colour is only used on a terminal |
+| `--mcp` | off | run as an MCP server on stdin and stdout (see [Use with AI agents](#use-with-ai-agents)) |
+| `--allow-destructive` | off | accepted with `--mcp`; depwhy has no destructive tools, so it changes nothing |
 | `--version` | | print the version |
 | `-h`, `--help` | | show help |
 
@@ -300,6 +302,105 @@ Package flags come from the lockfile: npm `dev`, `optional`, `devOptional`,
 
 If one lockfile fails to parse, the error is printed and the others are still
 searched.
+
+## Use with AI agents
+
+The CLI already works well for agents: `--json` has a stable shape and the exit
+codes are documented above.
+
+depwhy also runs as a [Model Context Protocol](https://modelcontextprotocol.io)
+server with `depwhy --mcp`, which Claude Code, Codex CLI, Cursor, VS Code and
+Gemini CLI can start for you. The command must be on the `PATH` the client
+sees. Editors started from a dock or launcher often do not inherit your shell
+`PATH`, so use the absolute path if the server fails to start (find it with
+`echo "$(go env GOPATH)/bin/depwhy"`).
+
+Claude Code (add `--scope user` to enable it in every project):
+
+```
+claude mcp add depwhy -- depwhy --mcp
+```
+
+Codex CLI:
+
+```
+codex mcp add depwhy -- depwhy --mcp
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.depwhy]
+command = "depwhy"
+args = ["--mcp"]
+```
+
+Cursor, in `.cursor/mcp.json` (or `~/.cursor/mcp.json` for every project):
+
+```json
+{
+  "mcpServers": {
+    "depwhy": { "command": "depwhy", "args": ["--mcp"] }
+  }
+}
+```
+
+VS Code, in `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "depwhy": { "type": "stdio", "command": "depwhy", "args": ["--mcp"] }
+  }
+}
+```
+
+Gemini CLI, in `~/.gemini/settings.json` (or `.gemini/settings.json` in a
+project):
+
+```json
+{
+  "mcpServers": {
+    "depwhy": { "command": "depwhy", "args": ["--mcp"] }
+  }
+}
+```
+
+Tools:
+
+| Tool | Access | Answers |
+|------|--------|---------|
+| `depwhy_explain` | read-only | every path from the project to a package (name or glob); arguments `package`, `dir`, `eco`, `max_paths` (default 10), `max_matches` (default 20); returns the same JSON as `--json` |
+| `depwhy_ecosystems` | read-only | which lockfiles are in `dir`, whether each parsed, package counts, roots, and recognized lockfiles depwhy does not read |
+
+Paths default to the server's working directory. When output is capped, or a
+lockfile could not be read while another one could, `warnings` in the result
+says so and names the argument that raises the cap. A query that matches
+nothing and hit an unreadable lockfile comes back as a tool error, like exit
+code 2.
+
+Go projects: `go mod graph` may need network access to download module files.
+Inside the MCP server it is stopped after 50 seconds and reported as an error
+(Codex CLI gives up on a tool call after 60 seconds by default); a retry
+usually gets further because downloaded modules stay in the module cache.
+Start the server with `GOPROXY=off` in its environment to forbid downloads.
+
+There are no destructive tools, so `--allow-destructive` has no effect.
+
+An agent skill with usage notes is in `skills/depwhy`. Install it for Claude
+Code with:
+
+```
+mkdir -p ~/.claude/skills && cp -r skills/depwhy ~/.claude/skills/
+```
+
+and for Codex CLI with:
+
+```
+mkdir -p ~/.agents/skills && cp -r skills/depwhy ~/.agents/skills/
+```
+
+Agents working on this repository should read [AGENTS.md](AGENTS.md).
 
 ## Limitations
 

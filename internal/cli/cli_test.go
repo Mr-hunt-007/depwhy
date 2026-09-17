@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,7 +250,7 @@ func TestUsageErrors(t *testing.T) {
 		{"negative max", []string{"--max-paths", "-1", "x"}, ExitError, "", "--max-paths"},
 		{"bad dir", []string{"--dir", filepath.Join(empty, "missing"), "x"}, ExitError, "", "is not a directory"},
 		{"no lockfile", []string{"--dir", empty, "x"}, ExitError, "", "no supported lockfile"},
-		{"version", []string{"--version"}, ExitFound, "depwhy 0.1.0\n", ""},
+		{"version", []string{"--version"}, ExitFound, "depwhy 0.2.0\n", ""},
 		{"help", []string{"-h"}, ExitFound, "Usage:", ""},
 	}
 	for _, tt := range tests {
@@ -285,5 +287,137 @@ func TestColor(t *testing.T) {
 		if strings.Contains(out, "\x1b[") {
 			t.Errorf("unexpected colour with env=%+v args=%v", tc.env, tc.args)
 		}
+	}
+}
+
+// mcpSession drives `depwhy --mcp` in-process over pipes.
+type mcpSession struct {
+	t    *testing.T
+	in   *io.PipeWriter
+	out  *bufio.Scanner
+	code chan int
+}
+
+func startMCP(t *testing.T, args ...string) *mcpSession {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	s := &mcpSession{t: t, in: inW, out: bufio.NewScanner(outR), code: make(chan int, 1)}
+	s.out.Buffer(make([]byte, 1<<20), 1<<20)
+	go func() {
+		var stderr bytes.Buffer
+		s.code <- Run(append([]string{"--mcp"}, args...), outW, &stderr, Env{Stdin: inR})
+		outW.Close()
+	}()
+	t.Cleanup(func() { inW.Close() })
+	return s
+}
+
+func (s *mcpSession) send(msg string) {
+	s.t.Helper()
+	if _, err := io.WriteString(s.in, msg+"\n"); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+func (s *mcpSession) recv() map[string]any {
+	s.t.Helper()
+	if !s.out.Scan() {
+		s.t.Fatalf("no response: %v", s.out.Err())
+	}
+	var m map[string]any
+	if err := json.Unmarshal(s.out.Bytes(), &m); err != nil {
+		s.t.Fatalf("bad JSON %q: %v", s.out.Text(), err)
+	}
+	return m
+}
+
+func (s *mcpSession) toolNames() []string {
+	s.t.Helper()
+	s.send(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	var names []string
+	for _, tl := range s.recv()["result"].(map[string]any)["tools"].([]any) {
+		m := tl.(map[string]any)
+		ann := m["annotations"].(map[string]any)
+		if ann["readOnlyHint"] != true || ann["destructiveHint"] != false {
+			s.t.Errorf("%s annotations = %v", m["name"], ann)
+		}
+		names = append(names, m["name"].(string))
+	}
+	return names
+}
+
+func (s *mcpSession) initialize() {
+	s.t.Helper()
+	s.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
+	res := s.recv()["result"].(map[string]any)
+	info := res["serverInfo"].(map[string]any)
+	if res["protocolVersion"] != "2025-06-18" || info["name"] != "depwhy" || info["version"] != Version || res["instructions"] == "" {
+		s.t.Errorf("initialize = %v", res)
+	}
+	s.send(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+}
+
+func TestMCPEndToEnd(t *testing.T) {
+	dir := writeFiles(t, map[string]string{"Cargo.lock": cargoLock, "Cargo.toml": cargoToml, "package-lock.json": npmLock, "yarn.lock": ""})
+	s := startMCP(t)
+	s.initialize()
+	if got := strings.Join(s.toolNames(), ","); got != "depwhy_ecosystems,depwhy_explain" {
+		t.Errorf("tools = %s", got)
+	}
+
+	args, _ := json.Marshal(map[string]any{"package": "itoa", "dir": dir})
+	s.send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"depwhy_explain","arguments":` + string(args) + `}}`)
+	res := s.recv()["result"].(map[string]any)
+	if res["isError"] != nil {
+		t.Fatalf("explain error: %v", res)
+	}
+	text := res["content"].([]any)[0].(map[string]any)["text"].(string)
+	cliOut, _, code := run(t, Env{}, "--dir", dir, "--json", "itoa")
+	if code != ExitFound || strings.TrimSpace(cliOut) != text {
+		t.Errorf("MCP output differs from --json:\n%s\n---\n%s", text, cliOut)
+	}
+	if sc, ok := res["structuredContent"].(map[string]any); !ok || sc["query"] != "itoa" {
+		t.Errorf("structuredContent = %v", res["structuredContent"])
+	}
+
+	args, _ = json.Marshal(map[string]any{"dir": dir})
+	s.send(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"depwhy_ecosystems","arguments":` + string(args) + `}}`)
+	res = s.recv()["result"].(map[string]any)
+	sc := res["structuredContent"].(map[string]any)
+	if res["isError"] != nil || len(sc["lockfiles"].([]any)) != 2 || sc["unsupported"].([]any)[0] != "yarn.lock" {
+		t.Errorf("ecosystems = %v", res)
+	}
+
+	s.send(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"depwhy_explain","arguments":{"package":"itoa","dir":"` + strings.ReplaceAll(filepath.Join(dir, "missing"), `\`, `\\`) + `"}}}`)
+	res = s.recv()["result"].(map[string]any)
+	if res["isError"] != true || !strings.Contains(res["content"].([]any)[0].(map[string]any)["text"].(string), "is not a directory") {
+		t.Errorf("bad dir = %v", res)
+	}
+
+	s.in.Close()
+	if c := <-s.code; c != ExitFound {
+		t.Errorf("exit code %d", c)
+	}
+}
+
+func TestMCPAllowDestructiveAndUsage(t *testing.T) {
+	// depwhy has no destructive tools: the flag is accepted and changes nothing.
+	s := startMCP(t, "--allow-destructive")
+	s.initialize()
+	if got := strings.Join(s.toolNames(), ","); got != "depwhy_ecosystems,depwhy_explain" {
+		t.Errorf("tools = %s", got)
+	}
+	s.in.Close()
+	<-s.code
+
+	for _, args := range [][]string{{"--mcp", "serde"}, {"--allow-destructive", "serde"}} {
+		out, errOut, code := run(t, Env{}, args...)
+		if code != ExitError || out != "" || errOut == "" {
+			t.Errorf("%v: code=%d out=%q err=%q", args, code, out, errOut)
+		}
+	}
+	if out, _, _ := run(t, Env{}, "--help"); !strings.Contains(out, "--mcp") || !strings.Contains(out, "--allow-destructive") {
+		t.Error("help does not document --mcp and --allow-destructive")
 	}
 }

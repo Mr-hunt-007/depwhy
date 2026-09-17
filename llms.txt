@@ -1,0 +1,15 @@
+# depwhy
+
+> Explain why a dependency is in a project: every path from the project to a package, read from npm, Cargo, uv, Poetry and Go lockfiles.
+
+depwhy is a Go command line tool with no dependencies beyond the standard library. It reads package-lock.json, npm-shrinkwrap.json, Cargo.lock, uv.lock, poetry.lock and go.mod (through `go mod graph`) and prints the dependency paths shortest first, with edge kinds such as dev, build, optional, peer and extras.
+
+Use `depwhy <package> --json` for a stable JSON report, with exit codes 0 (found), 1 (not found) and 2 (error). `depwhy --mcp` runs a Model Context Protocol server over stdio with the read-only tools `depwhy_explain` and `depwhy_ecosystems`.
+
+Install with `go install github.com/Mr-hunt-007/depwhy@latest`.
+
+## Docs
+
+- [README](https://github.com/Mr-hunt-007/depwhy/blob/main/README.md): install, usage, flags, JSON shape, exit codes, MCP setup and limitations
+- [AGENTS.md](https://github.com/Mr-hunt-007/depwhy/blob/main/AGENTS.md): repository layout, build and test commands, contributor rules
+- [SKILL.md](https://github.com/Mr-hunt-007/depwhy/blob/main/skills/depwhy/SKILL.md): agent skill for using depwhy from the command line

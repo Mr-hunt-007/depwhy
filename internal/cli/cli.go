@@ -2,33 +2,33 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"sort"
 	"strings"
 
-	"github.com/Mr-hunt-007/depwhy/internal/eco"
-	"github.com/Mr-hunt-007/depwhy/internal/graph"
+	"github.com/Mr-hunt-007/depwhy/internal/explain"
+	"github.com/Mr-hunt-007/depwhy/internal/mcptools"
 )
 
 // Version is the release version.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // Exit codes.
 const (
-	ExitFound    = 0
-	ExitNotFound = 1
-	ExitError    = 2
+	ExitFound    = explain.ExitFound
+	ExitNotFound = explain.ExitNotFound
+	ExitError    = explain.ExitError
 )
 
 // Env describes the process environment the CLI needs.
 type Env struct {
 	StdoutIsTTY bool
-	NoColorEnv  bool // NO_COLOR is set
+	NoColorEnv  bool      // NO_COLOR is set
+	Stdin       io.Reader // read by --mcp
 }
 
 const usage = `depwhy: why is this dependency here?
@@ -62,6 +62,14 @@ Flags:
   --version         print version
   -h, --help        show this help
 
+MCP server (for AI coding agents):
+  --mcp             serve the Model Context Protocol on stdin/stdout instead
+                    of running a query; other flags are ignored. Tools:
+                    depwhy_explain and depwhy_ecosystems, both read-only
+  --allow-destructive
+                    accepted with --mcp for consistency with sibling tools;
+                    depwhy has no destructive tools, so it changes nothing
+
 Exit codes:
   0  the package was found
   1  the package is not in any searched lockfile
@@ -75,6 +83,9 @@ type options struct {
 	json     bool
 	noColor  bool
 	version  bool
+	mcp      bool
+
+	allowDestructive bool
 }
 
 func parseArgs(args []string, stderr io.Writer) (options, []string, error) {
@@ -87,6 +98,8 @@ func parseArgs(args []string, stderr io.Writer) (options, []string, error) {
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.BoolVar(&o.noColor, "no-color", false, "")
 	fs.BoolVar(&o.version, "version", false, "")
+	fs.BoolVar(&o.mcp, "mcp", false, "")
+	fs.BoolVar(&o.allowDestructive, "allow-destructive", false, "")
 	var positional []string
 	for {
 		if err := fs.Parse(args); err != nil {
@@ -117,6 +130,17 @@ func Run(args []string, stdout, stderr io.Writer, env Env) int {
 		fmt.Fprintf(stdout, "depwhy %s\n", Version)
 		return ExitFound
 	}
+	if o.allowDestructive && !o.mcp {
+		fmt.Fprintf(stderr, "depwhy: --allow-destructive only applies with --mcp\n")
+		return ExitError
+	}
+	if o.mcp {
+		if len(positional) > 0 {
+			fmt.Fprintf(stderr, "depwhy: --mcp takes no package name (got %s)\n", strings.Join(positional, " "))
+			return ExitError
+		}
+		return serveMCP(stdout, stderr, env, o.allowDestructive)
+	}
 	if len(positional) != 1 {
 		if len(positional) == 0 {
 			fmt.Fprintf(stderr, "depwhy: missing package name\nRun 'depwhy --help' for usage.\n")
@@ -130,70 +154,17 @@ func Run(args []string, stdout, stderr io.Writer, env Env) int {
 		return ExitError
 	}
 	query := positional[0]
-	st, err := os.Stat(o.dir)
-	if err != nil || !st.IsDir() {
-		fmt.Fprintf(stderr, "depwhy: %s is not a directory\n", o.dir)
+
+	res, err := explain.Run(context.Background(), explain.Request{Dir: o.dir, Eco: o.eco, Query: query, MaxPaths: o.maxPaths})
+	if err != nil {
+		fmt.Fprintf(stderr, "depwhy: %s\n", strings.ReplaceAll(err.Error(), "\n", "\ndepwhy: "))
 		return ExitError
 	}
-
-	sources, unsupported := eco.Detect(o.dir)
-	if o.eco != "" {
-		sel, ok := eco.Ecosystems[strings.ToLower(o.eco)]
-		if !ok {
-			fmt.Fprintf(stderr, "depwhy: unknown --eco %q (use npm, cargo, python, uv, poetry or go)\n", o.eco)
-			return ExitError
-		}
-		var kept []eco.Source
-		for _, s := range sources {
-			if sel(s) {
-				kept = append(kept, s)
-			}
-		}
-		if len(kept) == 0 {
-			fmt.Fprintf(stderr, "depwhy: no %s lockfile in %s\n", o.eco, o.dir)
-			return ExitError
-		}
-		sources = kept
+	for _, le := range res.LoadErrors {
+		fmt.Fprintf(stderr, "depwhy: %v\n", le)
 	}
-	if len(sources) == 0 {
-		msg := fmt.Sprintf("depwhy: no supported lockfile in %s (looked for package-lock.json, npm-shrinkwrap.json, Cargo.lock, uv.lock, poetry.lock, go.mod)", o.dir)
-		if len(unsupported) > 0 {
-			msg += fmt.Sprintf("\ndepwhy: found %s, which depwhy does not read", strings.Join(unsupported, ", "))
-		}
-		fmt.Fprintln(stderr, msg)
-		return ExitError
-	}
-
-	rep := report{Query: query, Searched: []searched{}, Matches: []jsonMatch{}, Warnings: []string{}}
-	var matches []match
-	loadFailed := false
-	for _, s := range sources {
-		g, err := eco.Load(o.dir, s)
-		if err != nil {
-			loadFailed = true
-			fmt.Fprintf(stderr, "depwhy: %s (%s): %v\n", s.File, s.Ecosystem, err)
-			continue
-		}
-		rep.Searched = append(rep.Searched, searched{Ecosystem: g.Ecosystem, Lockfile: g.Source})
-		rep.Warnings = append(rep.Warnings, g.Warnings...)
-		found := findMatches(g, query, o.maxPaths)
-		if len(found) == 0 {
-			rep.Suggestions = append(rep.Suggestions, g.Suggest(query, 5)...)
-		}
-		matches = append(matches, found...)
-	}
-	for _, m := range matches {
-		rep.Matches = append(rep.Matches, m.toJSON())
-	}
-	rep.Suggestions = dedupe(rep.Suggestions)
-
-	code := ExitFound
-	if len(matches) == 0 {
-		code = ExitNotFound
-		if loadFailed {
-			code = ExitError
-		}
-	}
+	rep := res.Report
+	code := res.ExitCode()
 
 	if o.json {
 		enc := json.NewEncoder(stdout)
@@ -208,7 +179,7 @@ func Run(args []string, stdout, stderr io.Writer, env Env) int {
 	for _, w := range rep.Warnings {
 		fmt.Fprintf(stderr, "depwhy: warning: %s\n", w)
 	}
-	if len(matches) == 0 {
+	if len(res.Found) == 0 {
 		if len(rep.Searched) == 0 {
 			return code
 		}
@@ -223,7 +194,7 @@ func Run(args []string, stdout, stderr io.Writer, env Env) int {
 		return code
 	}
 	c := colors{on: env.StdoutIsTTY && !o.noColor && !env.NoColorEnv}
-	for i, m := range matches {
+	for i, m := range res.Found {
 		if i > 0 {
 			fmt.Fprintln(stdout)
 		}
@@ -232,114 +203,15 @@ func Run(args []string, stdout, stderr io.Writer, env Env) int {
 	return code
 }
 
-type match struct {
-	eco, source   string
-	name, version string
-	flags         []string
-	root          bool
-	result        graph.PathResult
-}
-
-// findMatches groups matching nodes by name and version (npm can install the
-// same version in several places) and searches paths for each group.
-func findMatches(g *graph.Graph, query string, maxPaths int) []match {
-	nodes := g.Match(query)
-	type key struct{ name, version string }
-	var order []key
-	groups := map[key][]*graph.Node{}
-	for _, n := range nodes {
-		k := key{n.Name, n.Version}
-		if _, ok := groups[k]; !ok {
-			order = append(order, k)
-		}
-		groups[k] = append(groups[k], n)
+func serveMCP(stdout, stderr io.Writer, env Env, allowDestructive bool) int {
+	stdin := env.Stdin
+	if stdin == nil {
+		stdin = strings.NewReader("")
 	}
-	var out []match
-	for _, k := range order {
-		m := match{eco: g.Ecosystem, source: g.Source, name: k.name, version: k.version, flags: []string{}}
-		var ids []string
-		seenFlag := map[string]bool{}
-		allRoot := true
-		for _, n := range groups[k] {
-			ids = append(ids, n.ID)
-			allRoot = allRoot && n.Root
-			for _, f := range n.Flags {
-				if !seenFlag[f] {
-					seenFlag[f] = true
-					m.flags = append(m.flags, f)
-				}
-			}
-		}
-		m.root = allRoot
-		m.result = g.Paths(ids, maxPaths, 0)
-		out = append(out, m)
+	srv := mcptools.New(Version, allowDestructive)
+	if err := srv.Serve(context.Background(), stdin, stdout); err != nil {
+		fmt.Fprintf(stderr, "depwhy: mcp: %v\n", err)
+		return ExitError
 	}
-	return out
-}
-
-func dedupe(in []string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, s := range in {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-type report struct {
-	Query       string      `json:"query"`
-	Searched    []searched  `json:"searched"`
-	Matches     []jsonMatch `json:"matches"`
-	Suggestions []string    `json:"suggestions,omitempty"`
-	Warnings    []string    `json:"warnings"`
-}
-
-type searched struct {
-	Ecosystem string `json:"ecosystem"`
-	Lockfile  string `json:"lockfile"`
-}
-
-type jsonStep struct {
-	Name    string `json:"name"`
-	Version string `json:"version,omitempty"`
-	Kind    string `json:"kind,omitempty"`
-}
-
-type jsonMatch struct {
-	Ecosystem     string       `json:"ecosystem"`
-	Lockfile      string       `json:"lockfile"`
-	Name          string       `json:"name"`
-	Version       string       `json:"version,omitempty"`
-	Flags         []string     `json:"flags"`
-	Root          bool         `json:"root"`
-	TotalPaths    int          `json:"total_paths"`
-	PathsComplete bool         `json:"paths_complete"`
-	Paths         [][]jsonStep `json:"paths"`
-}
-
-func (m match) toJSON() jsonMatch {
-	j := jsonMatch{
-		Ecosystem: m.eco, Lockfile: m.source, Name: m.name, Version: m.version,
-		Flags: m.flags, Root: m.root, TotalPaths: m.result.Total, PathsComplete: m.result.Complete,
-		Paths: [][]jsonStep{},
-	}
-	for _, p := range m.result.Paths {
-		steps := make([]jsonStep, 0, len(p))
-		for i, s := range p {
-			st := jsonStep{Name: s.Node.Name, Version: s.Node.Version}
-			if i > 0 {
-				st.Kind = s.Kind
-				if st.Kind == "" {
-					st.Kind = "normal"
-				}
-			}
-			steps = append(steps, st)
-		}
-		j.Paths = append(j.Paths, steps)
-	}
-	return j
+	return ExitFound
 }

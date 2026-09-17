@@ -74,6 +74,13 @@ var ErrGoMissing = errors.New("go.mod found but the go command is not on PATH; d
 
 // Load reads one detected source into a graph.
 func Load(dir string, s Source) (*graph.Graph, error) {
+	return LoadContext(context.Background(), dir, s, 0)
+}
+
+// LoadContext is Load with a context and a limit on how long `go mod graph`
+// may run (0 means DefaultGoTimeout). Only Go uses them: go may download
+// modules, and cancelling ctx or reaching the limit stops it.
+func LoadContext(ctx context.Context, dir string, s Source, goTimeout time.Duration) (*graph.Graph, error) {
 	read := func(rel string) ([]byte, error) { return os.ReadFile(filepath.Join(dir, rel)) }
 	dirName := filepath.Base(absOr(dir))
 	switch s.File {
@@ -148,7 +155,7 @@ func Load(dir string, s Source) (*graph.Graph, error) {
 		if err != nil {
 			return nil, err
 		}
-		out, err := runGoModGraph(dir)
+		out, err := runGoModGraph(ctx, dir, goTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -164,19 +171,34 @@ func absOr(dir string) string {
 	return dir
 }
 
-func runGoModGraph(dir string) ([]byte, error) {
+// DefaultGoTimeout bounds one `go mod graph` run.
+const DefaultGoTimeout = 5 * time.Minute
+
+func runGoModGraph(ctx context.Context, dir string, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = DefaultGoTimeout
+	}
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		return nil, ErrGoMissing
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, goBin, "mod", "graph")
 	cmd.Dir = dir
+	// go may start git or other helpers that keep the output pipes open after
+	// go itself is killed; do not wait for them.
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("`go mod graph` did not finish within %s (it may be downloading modules; the module cache keeps what was fetched, so a retry can succeed, or skip Go with --eco): %w", timeout, ctx.Err())
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("`go mod graph` stopped: %w", ctx.Err())
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()

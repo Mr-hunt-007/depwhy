@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/Mr-hunt-007/depwhy/internal/explain"
 	"github.com/Mr-hunt-007/depwhy/internal/graph"
 )
 
@@ -53,23 +54,23 @@ func label(c colors, s graph.Step, highlight bool) string {
 	return out
 }
 
-func renderMatch(w io.Writer, c colors, m match) {
-	header := c.bold(m.name)
-	if m.version != "" {
-		header += " " + m.version
+func renderMatch(w io.Writer, c colors, m explain.Found) {
+	header := c.bold(m.Name)
+	if m.Version != "" {
+		header += " " + m.Version
 	}
-	header += "  " + c.dim("("+m.eco+", "+m.source+")")
-	if len(m.flags) > 0 {
-		header += "  " + c.yellow(strings.Join(m.flags, ", "))
+	header += "  " + c.dim("("+m.Ecosystem+", "+m.Lockfile+")")
+	if len(m.Flags) > 0 {
+		header += "  " + c.yellow(strings.Join(m.Flags, ", "))
 	}
 	fmt.Fprintln(w, header)
 
-	res := m.result
+	res := m.Result
 	if res.Total == 0 && res.Complete {
 		fmt.Fprintln(w, c.dim("not reachable from any root (the lockfile may be stale, or this is an orphaned entry)"))
 		return
 	}
-	if m.root && res.Total == 1 && len(res.Paths) == 1 && len(res.Paths[0]) == 1 {
+	if m.Root && res.Total == 1 && len(res.Paths) == 1 && len(res.Paths[0]) == 1 {
 		fmt.Fprintln(w, c.dim("this is a root: the project itself, a workspace member or the main module"))
 		return
 	}

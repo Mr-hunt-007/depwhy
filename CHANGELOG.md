@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 (2026-09-17)
+
+- `depwhy --mcp` runs a Model Context Protocol server on stdio with two
+  read-only tools: `depwhy_explain` (same JSON as `--json`, with `max_paths`
+  and `max_matches` caps reported in `warnings`) and `depwhy_ecosystems`
+  (detected lockfiles, whether each parsed, package counts and roots).
+- `go mod graph` can be cancelled; in the MCP server it is limited to 50
+  seconds and a timeout is reported as an error instead of blocking.
+- `--allow-destructive` is accepted with `--mcp` for consistency with sibling
+  tools; depwhy has no destructive tools.
+- `AGENTS.md`, `CLAUDE.md`, `llms.txt` and an agent skill in `skills/depwhy`.
+
 ## 0.1.0
 
 First release.
