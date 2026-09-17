@@ -32,6 +32,14 @@ searches every lockfile it finds. (For npm in more depth, see the sibling tool
 go install github.com/Mr-hunt-007/depwhy@latest
 ```
 
+`go install` puts the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`). If your shell says `command not found`, add that directory to your `PATH`:
+
+```sh
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc && source ~/.zshrc   # bash: ~/.bashrc
+```
+
+On Windows the Go installer adds `%USERPROFILE%\go\bin` to `PATH` for you.
+
 Or build from source:
 
 ```
