@@ -1,0 +1,6 @@
+/depwhy
+/depwhy.exe
+/dist/
+*.test
+*.out
+.DS_Store
